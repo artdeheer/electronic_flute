@@ -1,128 +1,103 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include "PressureSensor.h"
 #include "CapSensor.h"
+#include "FluteLogic.h"
 #include "IMU.h"
+#include "PressureSensor.h"
 
 #define MIDI_CHANNEL 1
-#define BREATH_CUTOFF 0.4
+#define BREATH_THRESHOLD 0.35  // kPa required to trigger a note
 #define RESET_HOLD_TIME 5000
 
-int lastNote = 0;
-unsigned long allPressedStartTime = 0;
-bool resetTriggered = false;
-uint8_t lastMask = 0;
-unsigned long lastDebugTime = 0;
-
-PressureSensor breathSensor(A0, 10000.0, 20000.0, 5.03);
 CapSensor fluteKeys(5, 0x29); 
+FluteLogic fluteLogic;
 IMU orientation;
+// Pin A0, Resistor R1, Resistor R2, Supply Voltage
+PressureSensor breathSensor(A0, 10000.0, 20000.0, 5.03); 
 
-int getNote(uint8_t mask) {
-    if (mask == 0) return 0;
-
-    // Every bitmask gets a different note pattern.
-    // MIDI only supports 0–127, so this wraps into a playable range.
-    return 36 + (mask % 60); // notes 36–95
-}
-
-void initializeSystem() {
-    Wire.begin();
-    Wire1.begin();
-    breathSensor.begin();
-    fluteKeys.begin(&Wire1); 
-    orientation.begin();
-}
+int lastNote = 0;
+uint8_t lastMask = 0;
+bool isBlowing = false;
+unsigned long lastDebugTime = 0;
 
 void setup() {
     Serial.begin(115200);
-    delay(500);
+    while(!Serial && millis() < 3000); 
 
-    Serial.println("Starting system...");
-    initializeSystem();
-    Serial.println("System initialized.");
+    Serial.println("--- RECORDER INITIALIZING ---");
+
+    Wire.begin();   // MPU6050 (IMU) usually on Wire
+    Wire1.begin();  // CAP1188 on Wire1
+    
+    fluteKeys.hardwareReset(); 
+    
+    if (!fluteKeys.begin(&Wire1)) {
+        Serial.println("CAP1188 Init Failed!");
+    }
+    
+    if (!orientation.begin()) {
+        Serial.println("IMU (MPU6050) Init Failed!");
+    }
+
+    breathSensor.begin();
+
+    Serial.println("System Ready.");
 }
 
 void loop() {
     orientation.update();
-    float pressure = breathSensor.readKPa();
-    if (pressure < 0) pressure = 0;
+    float pressureKPa = breathSensor.readKPa();
+    uint8_t currentMask = fluteKeys.touched();
 
-    // 1. SCAN KEYS
-    uint8_t keyMask = 0;
-    bool allPressed = true;
-    for (uint8_t i = 0; i < 8; i++) {
-        if (fluteKeys.isTouched(i)) {
-            keyMask |= (1 << i);
-        } else {
-            allPressed = false;
-        }
-    }
+    int velocity = fluteLogic.getVelocityFromPressure(pressureKPa);
+    bool currentBlowing = (pressureKPa > BREATH_THRESHOLD);
 
-    // 2. RESET LOGIC
-    if (allPressed) {
-        if (allPressedStartTime == 0) allPressedStartTime = millis();
-        else if (millis() - allPressedStartTime > RESET_HOLD_TIME && !resetTriggered) {
-            initializeSystem();
-            resetTriggered = true;
-        }
-    } else {
-        allPressedStartTime = 0;
-        resetTriggered = false;
-    }
+    int currentNote = fluteLogic.getNoteFromFingering(currentMask);
 
-    // 3. MIDI LOGIC
-    int currentNote = getNote(keyMask);
-    int breathVal = constrain(map(pressure * 10, 4, 50, 0, 127), 0, 127);
-
-    usbMIDI.sendControlChange(2, breathVal, MIDI_CHANNEL);
-    usbMIDI.sendControlChange(11, breathVal, MIDI_CHANNEL);
-
-    bool blowing = pressure > BREATH_CUTOFF;
-
-    // Update note immediately when the bitmask changes
-    if (blowing && keyMask != 0) {
-        if (keyMask != lastMask) {
-            if (lastNote != 0) {
-                usbMIDI.sendNoteOff(lastNote, 0, MIDI_CHANNEL);
-            }
-
-            usbMIDI.sendNoteOn(currentNote, breathVal, MIDI_CHANNEL);
-
+    // Case A: You just started blowing
+    if (currentBlowing && !isBlowing) {
+        if (currentNote > 0) {
+            usbMIDI.sendNoteOn(currentNote, velocity, MIDI_CHANNEL);
             lastNote = currentNote;
-            lastMask = keyMask;
+            lastMask = currentMask;
+            isBlowing = true;
         }
-    } else {
-        if (lastNote != 0) {
-            usbMIDI.sendNoteOff(lastNote, 0, MIDI_CHANNEL);
+    }
+    // Case B: You are blowing but changed your fingering (Legato)
+    else if (currentBlowing && isBlowing) {
+        if (currentMask != lastMask) {
+            if (lastNote > 0) usbMIDI.sendNoteOff(lastNote, 0, MIDI_CHANNEL);
+            if (currentNote > 0) usbMIDI.sendNoteOn(currentNote, velocity, MIDI_CHANNEL);
+            lastNote = currentNote;
+            lastMask = currentMask;
         }
-
+        // Continuous Breath Expression (Breath Controller CC#2)
+        usbMIDI.sendControlChange(2, velocity, MIDI_CHANNEL);
+    }
+    // Case C: You stopped blowing
+    else if (!currentBlowing && isBlowing) {
+        if (lastNote > 0) usbMIDI.sendNoteOff(lastNote, 0, MIDI_CHANNEL);
+        isBlowing = false;
         lastNote = 0;
         lastMask = 0;
     }
 
-    // Debug only 10 times per second so it does not slow MIDI down
-    if (millis() - lastDebugTime > 100) {
+    // IMU SPECIAL EFFECT ---
+    // Use the tilt (pitch) to control an effect like a Wah or Filter (CC 74)
+    int tiltEffect = fluteLogic.getExpressionFromTilt(orientation.pitch);
+    usbMIDI.sendControlChange(74, tiltEffect, MIDI_CHANNEL); 
+    
+    // Optional: Use Roll for Pitch Bend or Modulation
+    int rollEffect = fluteLogic.getExpressionFromTilt(orientation.roll);
+    usbMIDI.sendControlChange(1, rollEffect, MIDI_CHANNEL); // Modulation wheel
+
+    // LOG
+    if (millis() - lastDebugTime > 200) {
         lastDebugTime = millis();
-
-        Serial.print("Mask: 0b");
-        for (int i = 7; i >= 0; i--) {
-            Serial.print((keyMask >> i) & 1);
-        }
-
-        Serial.print(" | Decimal: ");
-        Serial.print(keyMask);
-        Serial.print(" | Note: ");
-        Serial.print(currentNote);
-        Serial.print(" | Pressure: ");
-        Serial.print(pressure);
-        Serial.print(" | Breath: ");
-        Serial.println(breathVal);
+        Serial.print("Note: "); Serial.print(currentNote);
+        Serial.print(" | Pressure: "); Serial.print(pressureKPa);
+        Serial.print(" | Tilt: "); Serial.println(orientation.pitch);
     }
-
-    // 4. PITCH BEND
-    int bend = map(constrain(orientation.pitch, -30, 30), -30, 30, 0, 16383);
-    usbMIDI.sendPitchBend(bend, MIDI_CHANNEL);
 
     while (usbMIDI.read());
 }

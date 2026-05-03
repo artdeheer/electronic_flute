@@ -1,4 +1,3 @@
-#ifndef CAP_SENSOR_H
 #define CAP_SENSOR_H
 
 #include <Arduino.h>
@@ -7,50 +6,54 @@
 
 class CapSensor {
 private:
-    Adafruit_CAP1188 _cap;
     int _resetPin;
     uint8_t _address;
+    TwoWire* _wire;
 
 public:
-    // The resetPin is passed here (e.g., 5)
     CapSensor(int resetPin, uint8_t address = 0x29) 
-        : _cap(resetPin), _resetPin(resetPin), _address(address) {}
+        : _resetPin(resetPin), _address(address) {}
 
-    // Performs a physical hardware reset on the CAP1188
     void hardwareReset() {
         if (_resetPin != -1) {
             pinMode(_resetPin, OUTPUT);
             digitalWrite(_resetPin, HIGH);
-            delay(10);
+            delay(20);
             digitalWrite(_resetPin, LOW);
-            delay(100); // Wait for the chip to reboot and re-calibrate
+            delay(150); 
         }
     }
 
-    void begin(TwoWire *theWire = &Wire1) {
-        // Trigger the hardware reset before attempting to communicate
-        hardwareReset();
+    bool begin(TwoWire *theWire = &Wire1) {
+        _wire = theWire;
         
-        if (!_cap.begin(_address, theWire)) {
-            Serial.println("CAP1188 not found!");
-            while (1) delay(10);
-        }
-        
-        // Set sensitivity (0x04 is high sensitivity)
-        _cap.writeRegister(0x1F, 0x04); 
-        Serial.println("CAP1188 Online (Hardware Reset Complete)");
+        _wire->beginTransmission(_address);
+        if (_wire->endTransmission() != 0) return false;
+
+        // 1. Set sensitivity
+        writeRegister(0x1F, 0x04); 
+
+        // 2. ENABLE THE LEDS: Link all 8 sensors to their corresponding LEDs
+        writeRegister(0x72, 0xFF); 
+
+        // 3. Optional: Set LED behavior to "Direct" (instantly on/off)
+        writeRegister(0x81, 0x00); 
+
+        return true;
     }
 
-    // Get the raw Delta Count for a channel (0-7)
-    int8_t getRawValue(uint8_t channel) {
-        if (channel > 7) return 0;
-        // Delta counts are 2's complement (signed)
-        return (int8_t)_cap.readRegister(0x10 + channel);
+    void writeRegister(uint8_t reg, uint8_t value) {
+        _wire->beginTransmission(_address);
+        _wire->write(reg);
+        _wire->write(value);
+        _wire->endTransmission();
     }
 
-    bool isTouched(uint8_t channel) {
-        return (_cap.touched() & (1 << channel));
+    uint8_t touched() {
+        _wire->beginTransmission(_address);
+        _wire->write(0x03); 
+        _wire->endTransmission(false);
+        _wire->requestFrom(_address, (uint8_t)1);
+        return _wire->available() ? _wire->read() : 0;
     }
 };
-
-#endif
